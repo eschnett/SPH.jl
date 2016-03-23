@@ -12,10 +12,14 @@ immutable InitialBoxParameters
     xmax::Float64; ymax::Float64; zmax::Float64
     ni::Int; nj::Int; nk::Int
 end
+# const idpars = InitialBoxParameters(0.0,
+#                                     -0.5, -0.5, -0.5,
+#                                     +0.5, +0.5, +0.5,
+#                                     10, 10, 10)
 const idpars = InitialBoxParameters(0.0,
                                     -0.5, -0.5, -0.5,
                                     +0.5, +0.5, +0.5,
-                                    10, 10, 10)
+                                    100, 100, 100)
 
 immutable SPHParameters
     hsml::Float64
@@ -31,7 +35,10 @@ immutable SPHParameters
             1.0 / hsml)
     end
 end
-const sphpars = SPHParameters(0.3,
+# const sphpars = SPHParameters(0.3,
+#                               -2.0, -2.0, -2.0,
+#                               +2.0, +2.0, +2.0)
+const sphpars = SPHParameters(0.03,
                               -2.0, -2.0, -2.0,
                               +2.0, +2.0, +2.0)
 
@@ -40,9 +47,15 @@ const sphpars = SPHParameters(0.3,
 immutable SimulationParameters
     tmax::Float64
     dt::Float64
+    outfile::AbstractString
+    outevery::Int
 end
+# const simpars = SimulationParameters(1.0,
+#                                      0.01,
+#                                      "sph", 10)
 const simpars = SimulationParameters(1.0,
-                                     0.01)
+                                     0.001,
+                                     "sph", 100)
 
 
 
@@ -85,30 +98,30 @@ function resize!(p::Particles, np::Int)
     resize!(p.uint, np)
 end
 
-function axpy(a, x::Vector, y::Vector)
-    r = similar(y)
-    @assert length(x) == length(y)
-    @inbounds @simd for i in eachindex(y)
-        r[i] = a * x[i] + y[i]
+@fastmath function lincom!{T}(r::Vector{T}, v0::Vector{T}, s1::T, v1::Vector{T})
+    @assert length(v0) == length(r)
+    @assert length(v1) == length(r)
+    @inbounds @simd for i in eachindex(r)
+        r[i] = v0[i] + s1 * v1[i]
     end
     r
 end
 
-function axpy(a::Float64, x::Particles, y::Particles)
-    @assert x.nparts == y.nparts
+function lincom(p0::Particles, s1::Float64, p1::Particles)
+    @assert p1.nparts == p0.nparts
     p = Particles()
-    resize!(p, y.nparts)
-    p.time = a * x.time + y.time
-    p.id[:] = y.id[:]           # ids are not modified
-    p.posx[:] = a * x.posx[:] + y.posx[:]
-    p.posy[:] = a * x.posy[:] + y.posy[:]
-    p.posz[:] = a * x.posz[:] + y.posz[:]
-    p.vol[:] = a * x.vol[:] + y.vol[:]
-    p.mass[:] = a * x.mass[:] + y.mass[:]
-    p.velx[:] = a * x.velx[:] + y.velx[:]
-    p.vely[:] = a * x.vely[:] + y.vely[:]
-    p.velz[:] = a * x.velz[:] + y.velz[:]
-    p.uint[:] = a * x.uint[:] + y.uint[:]
+    resize!(p, p0.nparts)
+    p.time = p0.time + s1 * p1.time
+    copy!(p.id, p0.id)          # ids are not modified
+    lincom!(p.posx, p0.posx, s1, p1.posx)
+    lincom!(p.posy, p0.posy, s1, p1.posy)
+    lincom!(p.posz, p0.posz, s1, p1.posz)
+    lincom!(p.vol, p0.vol, s1, p1.vol)
+    lincom!(p.mass, p0.mass, s1, p1.mass)
+    lincom!(p.velx, p0.velx, s1, p1.velx)
+    lincom!(p.vely, p0.vely, s1, p1.vely)
+    lincom!(p.velz, p0.velz, s1, p1.velz)
+    lincom!(p.uint, p0.uint, s1, p1.uint)
     p
 end
 
@@ -135,9 +148,6 @@ end
 
 
 
-
-
-
 immutable Interaction
     iaci::Int
     iacj::Int
@@ -153,14 +163,14 @@ end
 
 
 
-function kernel_nonzero(par::SPHParameters,
-                        dx::Float64, dy::Float64, dz::Float64)
+@fastmath function kernel_nonzero(par::SPHParameters,
+                                  dx::Float64, dy::Float64, dz::Float64)
     dr2 = dx^2 + dy^2 + dz^2
     dr2 < par.hsml^2
 end
 
-function kernel(par::SPHParameters,
-                dx::Float64, dy::Float64, dz::Float64)
+@fastmath function kernel(par::SPHParameters,
+                          dx::Float64, dy::Float64, dz::Float64)
     dr2 = dx^2 + dy^2 + dz^2
     if dr2 >= par.hsml^2
         return 0.0
@@ -175,8 +185,8 @@ function kernel(par::SPHParameters,
     w * par.hsml_1^3
 end
 
-function grad_kernel(par::SPHParameters,
-                     dx::Float64, dy::Float64, dz::Float64)
+@fastmath function grad_kernel(par::SPHParameters,
+                               dx::Float64, dy::Float64, dz::Float64)
     dr2 = dx^2 + dy^2 + dz^2
     if dr2 >= par.hsml^2
         return 0.0, 0.0, 0.0
@@ -195,7 +205,7 @@ end
 
 
 
-function initial(par::InitialBoxParameters)
+@fastmath function initial(par::InitialBoxParameters)
     dx = (par.xmax - par.xmin) / par.ni
     dy = (par.ymax - par.ymin) / par.nj
     dz = (par.zmax - par.zmin) / par.nk
@@ -204,25 +214,27 @@ function initial(par::InitialBoxParameters)
     p = Particles()
     resize!(p, ncells)
     p.time = par.time
-    for gk in 1:par.nk, gj in 1:par.nj, gi in 1:par.ni
-        i = gi-1 + par.ni * (gj-1 + par.nj * (gk-1)) + 1
-        p.id[i] = i - 1
-        p.posx[i] = par.xmin + (gi - 0.5) * dx
-        p.posy[i] = par.ymin + (gj - 0.5) * dy
-        p.posz[i] = par.zmin + (gk - 0.5) * dz
-        p.vol[i] = dV
-        p.mass[i] = 1.0 / p.nparts
-        p.velx[i] = 0.0
-        p.vely[i] = 0.0
-        p.velz[i] = 0.0
-        p.uint[i] = 1.0
+    @inbounds for gk in 1:par.nk, gj in 1:par.nj
+        @simd for gi in 1:par.ni
+            i = gi-1 + par.ni * (gj-1 + par.nj * (gk-1)) + 1
+            p.id[i] = i - 1
+            p.posx[i] = par.xmin + (gi - 0.5) * dx
+            p.posy[i] = par.ymin + (gj - 0.5) * dy
+            p.posz[i] = par.zmin + (gk - 0.5) * dz
+            p.vol[i] = dV
+            p.mass[i] = 1.0 / p.nparts
+            p.velx[i] = 0.0
+            p.vely[i] = 0.0
+            p.velz[i] = 0.0
+            p.uint[i] = 1.0
+        end
     end
     p
 end
 
 
 
-function interactions(par::SPHParameters, p::Particles)
+@fastmath function interactions(par::SPHParameters, p::Particles)
     dx_1 = 1.0 / par.hsml
     dy_1 = 1.0 / par.hsml
     dz_1 = 1.0 / par.hsml
@@ -234,7 +246,7 @@ function interactions(par::SPHParameters, p::Particles)
     grid = Array{Int}(ni, nj, nk)
     fill!(grid, 0)
     next = Vector{Int}(p.nparts)
-    for i=1:p.nparts
+    @inbounds for i=1:p.nparts
         gi = floor(Int, (p.posx[i] - par.xmin) * dx_1) + 1
         gj = floor(Int, (p.posy[i] - par.ymin) * dy_1) + 1
         gk = floor(Int, (p.posz[i] - par.zmin) * dz_1) + 1
@@ -247,7 +259,7 @@ function interactions(par::SPHParameters, p::Particles)
 
     maxnparts = 0               # maximum particles per cell
     nzeroparts = 0              # num cells without particle
-    for i in grid
+    @inbounds for i in grid
         nparts = 0
         while i > 0
             nparts += 1
@@ -258,7 +270,7 @@ function interactions(par::SPHParameters, p::Particles)
     end
 
     iacs = Interactions()
-    for i=1:p.nparts
+    @inbounds for i=1:p.nparts
         gi = floor(Int, (p.posx[i] - par.xmin) * dx_1) + 1
         gj = floor(Int, (p.posy[i] - par.ymin) * dy_1) + 1
         gk = floor(Int, (p.posz[i] - par.zmin) * dz_1) + 1
@@ -310,9 +322,9 @@ end
 
 
 
-function eos(p::Particles)
+@fastmath function eos(p::Particles)
     press = Vector{Float64}(p.nparts)
-    for i = 1:p.nparts
+    @inbounds for i = 1:p.nparts
         press[i] = p.mass[i] / p.vol[i] * p.uint[i]
     end
     press
@@ -320,14 +332,14 @@ end
 
 
 
-function rhs(par::SPHParameters,
-             p::Particles, press::Vector{Float64}, iacs::Interactions)
+@fastmath function rhs(par::SPHParameters,
+                       p::Particles, press::Vector{Float64}, iacs::Interactions)
     rhs = Particles()
     resize!(rhs, p.nparts)
 
     rhs.time = 1.0
 
-    for i = 1:p.nparts
+    @inbounds for i = 1:p.nparts
         rhs.id[i] = p.id[i]     # ids are not modified
         rhs.posx[i] = p.velx[i]
         rhs.posy[i] = p.vely[i]
@@ -340,7 +352,7 @@ function rhs(par::SPHParameters,
         rhs.uint[i] = 0.0
     end
 
-    for iac in iacs.iacs
+    @inbounds for iac in iacs.iacs
         i, j = iac.iaci, iac.iacj
         
         xij = p.posx[i] - p.posx[j]
@@ -382,47 +394,49 @@ function State(p::Particles, iter::Int)
     state.iter = iter
     state.p = p
     state.press = eos(state.p)
-    state.iacs = interactions(state.p)
-    state.rhs = rhs(state.p, state.press, state.iacs)
+    state.iacs = interactions(sphpars, state.p)
+    state.rhs = rhs(sphpars, state.p, state.press, state.iacs)
     state
 end
 
 
 
-function rk2(state0::State)
+function rk2(par::SimulationParameters, state0::State)
     iter0 = state0.iter
-    p1 = axpy(dt/2, state0.rhs, state0.p)
+    p1 = lincom(state0.p, par.dt/2, state0.rhs)
     state1 = State(p1, iter0)
-    p2 = axpy(dt, state1.rhs, state0.p)
-    p = sort(p2)
-    state = State(p, iter0+1)
-    state
+    p2 = lincom(state0.p, par.dt, state1.rhs)
+    p2 = sort(p2)
+    state2 = State(p2, iter0+1)
+    state2
 end
 
 
 
-function output(state::State)
+function output(par::SimulationParameters, state::State, islast::Bool=false)
     println("Iteration $(state.iter), time $(state.p.time)")
-    filename = "sph.h5"
-    # Truncate before first iteration
-    mode = state.iter == 0 ? "w" : "r+"
-    options = ("libver_bounds",
-               (HDF5.H5F_LIBVER_EARLIEST, HDF5.H5F_LIBVER_LATEST))
-    h5open(filename, mode, options...) do h5file
-        group = @sprintf "%08d" state.iter
-        p = state.p
-        active = 1:p.nparts
-        h5file["$group/time"] = p.time
-        h5file["$group/id"] = p.id[active]
-        h5file["$group/posx"] = p.posx[active]
-        h5file["$group/posy"] = p.posy[active]
-        h5file["$group/posz"] = p.posz[active]
-        h5file["$group/vol"] = p.vol[active]
-        h5file["$group/mass"] = p.mass[active]
-        h5file["$group/velx"] = p.velx[active]
-        h5file["$group/vely"] = p.vely[active]
-        h5file["$group/velz"] = p.velz[active]
-        h5file["$group/uint"] = p.uint[active]
+    if par.outevery > 0 && (islast || state.iter % par.outevery == 0)
+        filename = "$(par.outfile).h5"
+        # Truncate before first iteration
+        mode = state.iter == 0 ? "w" : "r+"
+        options = ("libver_bounds",
+                   (HDF5.H5F_LIBVER_EARLIEST, HDF5.H5F_LIBVER_LATEST))
+        h5open(filename, mode, options...) do h5file
+            group = @sprintf "%08d" state.iter
+            p = state.p
+            active = 1:p.nparts
+            h5file["$group/time"] = p.time
+            h5file["$group/id"] = p.id[active]
+            h5file["$group/posx"] = p.posx[active]
+            h5file["$group/posy"] = p.posy[active]
+            h5file["$group/posz"] = p.posz[active]
+            h5file["$group/vol"] = p.vol[active]
+            h5file["$group/mass"] = p.mass[active]
+            h5file["$group/velx"] = p.velx[active]
+            h5file["$group/vely"] = p.vely[active]
+            h5file["$group/velz"] = p.velz[active]
+            h5file["$group/uint"] = p.uint[active]
+        end
     end
 end
 
@@ -430,14 +444,15 @@ end
 
 function main()
     info("SPH")
-    p = initial()
+    p = initial(idpars)
     p = sort(p)
     state = State(p, 0)
-    output(state)
-    while state.p.time < tmax
-        state = rk2(state)
-        output(state)
+    while state.p.time < simpars.tmax
+        output(simpars, state)
+        state = rk2(simpars, state)
+        break
     end
+    output(simpars, state, true)
     info("Done.")
 end
 
